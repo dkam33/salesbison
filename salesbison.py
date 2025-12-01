@@ -25,13 +25,10 @@ sheet_api = sheets_service.spreadsheets().values()
 
 
 # ===========================
-# LOCAL IN-MEMORY STORAGE
+# STORAGE
 # ===========================
-# Tracks today's sales
-daily_sales = {}
-
-# Tracks ALL-TIME sales
-all_time_sales = {}   # rep_id -> int
+daily_sales = {}       # per day
+all_time_sales = {}    # forever
 
 
 def add_all_time_sale(rep_id):
@@ -41,12 +38,11 @@ def add_all_time_sale(rep_id):
 
 
 # ===========================
-# GOOGLE SHEETS APPEND
+# GOOGLE SHEET LOGGING
 # ===========================
 def append_sale_to_sheet(rep_name, customer, isp, plan):
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    row = [[timestamp, rep_name, customer, isp, plan]]
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    row = [[ts, rep_name, customer, isp, plan]]
 
     sheet_api.append(
         spreadsheetId=GOOGLE_SHEET_ID,
@@ -57,10 +53,10 @@ def append_sale_to_sheet(rep_name, customer, isp, plan):
 
 
 # ===========================
-#   DISCORD ELEMENTS
+# DISCORD UI
 # ===========================
 
-# -------- Customer Modal --------
+# -------- Modal --------
 class CustomerModal(discord.ui.Modal, title="Enter Customer Name"):
     customer_name = discord.ui.TextInput(
         label="Customer Name",
@@ -73,8 +69,13 @@ class CustomerModal(discord.ui.Modal, title="Enter Customer Name"):
         self.user_id = user_id
 
     async def on_submit(self, interaction):
+        embed = discord.Embed(
+            title="Customer Name Received",
+            description=f"**{self.customer_name.value}**\n\nSelect the ISP below:",
+            color=discord.Color.blurple()
+        )
         await interaction.response.send_message(
-            f"Customer: **{self.customer_name.value}**\nSelect ISP:",
+            embed=embed,
             view=ISPButtons(self.customer_name.value, self.user_id),
             ephemeral=True
         )
@@ -88,8 +89,13 @@ class ISPButtons(discord.ui.View):
         self.user_id = user_id
 
     async def pick(self, interaction, isp):
+        embed = discord.Embed(
+            title="ISP Selected",
+            description=f"**{isp}** chosen.\n\nNow choose a plan:",
+            color=discord.Color.green()
+        )
         await interaction.response.send_message(
-            f"ISP **{isp}** selected.\nChoose plan:",
+            embed=embed,
             view=PlanDropdown(self.customer_name, isp, self.user_id),
             ephemeral=True
         )
@@ -140,31 +146,41 @@ class PlanSelect(discord.ui.Select):
         rep_id = self.user_id
         rep_name = interaction.user.display_name
 
-        # Track today's sales
+        # track daily
         daily_sales.setdefault(rep_id, 0)
         daily_sales[rep_id] += 1
 
-        # Track all-time
+        # track all-time
         add_all_time_sale(rep_id)
 
-        # Log to Google Sheets
+        # google sheet
         append_sale_to_sheet(rep_name, self.customer, self.isp, plan)
 
-        await interaction.response.send_message(
-            f"✅ **Sale Logged!**\n"
-            f"Rep: **{rep_name}**\n"
-            f"Customer: **{self.customer}**\n"
-            f"ISP: **{self.isp}**\n"
-            f"Plan: **{plan}**\n"
-            f"Total all-time sales: **{all_time_sales[rep_id]}**",
-            ephemeral=False
+        # confirmation embed
+        embed = discord.Embed(
+            title="✅ Sale Logged!",
+            color=discord.Color.gold()
         )
+        embed.add_field(name="Rep", value=rep_name, inline=False)
+        embed.add_field(name="Customer", value=self.customer, inline=False)
+        embed.add_field(name="ISP", value=self.isp, inline=True)
+        embed.add_field(name="Plan", value=plan, inline=True)
+        embed.add_field(
+            name="Total All-Time Sales",
+            value=str(all_time_sales[rep_id]),
+            inline=False
+        )
+        embed.set_footer(text="Sale recorded successfully")
+
+        await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
 # ===========================
-#   BOT SETUP
+# BOT SETUP
 # ===========================
 intents = discord.Intents.default()
+intents.members = True   # IMPORTANT for leaderboard names
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
@@ -175,7 +191,7 @@ async def on_ready():
 
 
 # ===========================
-#   SLASH COMMANDS
+# SLASH COMMANDS
 # ===========================
 
 # ----- SALE -----
@@ -184,46 +200,73 @@ async def sale(interaction):
     await interaction.response.send_modal(CustomerModal(interaction.user.id))
 
 
-# ----- MY SALES (TODAY) -----
-@bot.tree.command(name="mysales", description="Your sales today")
+# ----- MY SALES -----
+@bot.tree.command(name="mysales", description="View your sales today")
 async def mysales(interaction):
     rep_id = interaction.user.id
     count = daily_sales.get(rep_id, 0)
-    await interaction.response.send_message(
-        f"You have **{count}** sales today.", ephemeral=True
+
+    embed = discord.Embed(
+        title="📊 Your Sales Today",
+        description=f"You have **{count}** sales today.",
+        color=discord.Color.blue()
     )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ----- LEADERBOARD (ALL-TIME) -----
-@bot.tree.command(name="leaderboard", description="View all-time sales leaderboard")
+# ----- LEADERBOARD (ALL TIME) -----
+@bot.tree.command(name="leaderboard", description="All-time leaderboard")
 async def leaderboard(interaction):
 
     if not all_time_sales:
-        return await interaction.response.send_message("No all-time sales recorded yet.")
+        return await interaction.response.send_message(
+            "No sales recorded yet."
+        )
 
     sorted_reps = sorted(all_time_sales.items(), key=lambda x: x[1], reverse=True)
 
-    text = "🏆 **All-Time Leaderboard**\n\n"
+    embed = discord.Embed(
+        title="🏆 All-Time Sales Leaderboard",
+        color=discord.Color.gold()
+    )
+
+    medals = ["🥇", "🥈", "🥉"]
+
     for i, (uid, total) in enumerate(sorted_reps, start=1):
         member = interaction.guild.get_member(uid)
         name = member.display_name if member else "Unknown"
-        text += f"**{i}. {name}** — {total} sales\n"
 
-    await interaction.response.send_message(text)
+        rank_icon = medals[i-1] if i <= 3 else f"#{i}"
+
+        embed.add_field(
+            name=f"{rank_icon} {name}",
+            value=f"**{total}** sales",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed)
 
 
 # ----- RESET -----
-@bot.tree.command(name="reset", description="Reset all sales (Admin Only)")
+@bot.tree.command(name="reset", description="Reset all sales")
 async def reset(interaction):
 
     if not interaction.user.guild_permissions.administrator:
-        return await interaction.response.send_message("Admin only.", ephemeral=True)
+        return await interaction.response.send_message(
+            "Admin only.", ephemeral=True
+        )
 
     global daily_sales, all_time_sales
     daily_sales = {}
     all_time_sales = {}
 
-    await interaction.response.send_message("🧹 All sales reset successfully.")
+    embed = discord.Embed(
+        title="🧹 Sales Reset",
+        description="All sales have been cleared.",
+        color=discord.Color.red()
+    )
+
+    await interaction.response.send_message(embed=embed)
 
 
 # ===========================
