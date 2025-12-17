@@ -3,7 +3,7 @@ import json
 import discord
 from discord.ext import commands
 from discord import app_commands
-from datetime import datetime, date
+from datetime import datetime, timezone
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -13,85 +13,173 @@ from googleapiclient.discovery import build
 # ===========================
 TOKEN = os.getenv("DISCORD_TOKEN")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+SALES_CHANNEL_ID = int(os.getenv("SALES_CHANNEL_ID", "0"))  # REQUIRED
+
+if not TOKEN:
+    raise RuntimeError("Missing DISCORD_TOKEN env var.")
+if not GOOGLE_SHEET_ID:
+    raise RuntimeError("Missing GOOGLE_SHEET_ID env var.")
+if not os.getenv("GOOGLE_SERVICE_JSON"):
+    raise RuntimeError("Missing GOOGLE_SERVICE_JSON env var.")
+if SALES_CHANNEL_ID == 0:
+    raise RuntimeError("Missing/invalid SALES_CHANNEL_ID env var.")
 
 service_info = json.loads(os.getenv("GOOGLE_SERVICE_JSON"))
 credentials = service_account.Credentials.from_service_account_info(
     service_info,
     scopes=["https://www.googleapis.com/auth/spreadsheets"]
 )
-
 sheets_service = build("sheets", "v4", credentials=credentials)
 sheet_api = sheets_service.spreadsheets().values()
 
+SHEET_RANGE = "Sheet1!A:E"  # Timestamp | RepName | Customer | ISP | Plan
 
 # ===========================
-# STORAGE
+# HELPERS: CHANNEL GATING
 # ===========================
-daily_sales = {}       # per day
-all_time_sales = {}    # forever
-
-
-def add_all_time_sale(rep_id):
-    if rep_id not in all_time_sales:
-        all_time_sales[rep_id] = 0
-    all_time_sales[rep_id] += 1
-
+async def require_sales_channel(interaction: discord.Interaction) -> bool:
+    """Return True if ok, otherwise respond and return False."""
+    if interaction.channel_id != SALES_CHANNEL_ID:
+        await interaction.response.send_message(
+            "This bot only works in the **#sales** channel.",
+            ephemeral=True
+        )
+        return False
+    return True
 
 # ===========================
-# GOOGLE SHEET LOGGING
+# GOOGLE SHEETS: APPEND + READ COUNTS
 # ===========================
-def append_sale_to_sheet(rep_name, customer, isp, plan):
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+def append_sale_to_sheet(rep_name: str, customer: str, isp: str, plan: str):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     row = [[ts, rep_name, customer, isp, plan]]
-
     sheet_api.append(
         spreadsheetId=GOOGLE_SHEET_ID,
-        range="Sheet1!A:E",
+        range=SHEET_RANGE,
         valueInputOption="RAW",
-        body={"values": row}
+        body={"values": row},
     ).execute()
 
+def _parse_utc_timestamp(ts_str: str) -> datetime | None:
+    """
+    Expects: 'YYYY-MM-DD HH:MM:SS UTC'
+    Returns aware datetime in UTC or None if parsing fails.
+    """
+    try:
+        dt = datetime.strptime(ts_str.strip(), "%Y-%m-%d %H:%M:%S UTC")
+        return dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+def fetch_sales_rows() -> list[list[str]]:
+    """
+    Returns all rows excluding header (if present).
+    """
+    resp = sheet_api.get(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=SHEET_RANGE
+    ).execute()
+
+    values = resp.get("values", [])
+    if not values:
+        return []
+
+    # If first row looks like a header, drop it
+    first = [c.strip().lower() for c in values[0]]
+    header_like = ("timestamp" in first[0]) or ("rep" in "".join(first))
+    if header_like:
+        values = values[1:]
+
+    return values
+
+def compute_counts(rows: list[list[str]], *, mode: str) -> dict[str, int]:
+    """
+    mode in {"daily","monthly","ytd","all"}
+    Uses RepName (col B) and Timestamp (col A).
+    """
+    now = datetime.now(timezone.utc)
+    counts: dict[str, int] = {}
+
+    for r in rows:
+        if len(r) < 2:
+            continue
+        ts = _parse_utc_timestamp(r[0]) if len(r) >= 1 else None
+        rep = r[1].strip() if len(r) >= 2 else ""
+        if not rep or not ts:
+            continue
+
+        include = False
+        if mode == "all":
+            include = True
+        elif mode == "daily":
+            include = (ts.date() == now.date())
+        elif mode == "monthly":
+            include = (ts.year == now.year and ts.month == now.month)
+        elif mode == "ytd":
+            include = (ts.year == now.year)
+
+        if include:
+            counts[rep] = counts.get(rep, 0) + 1
+
+    return counts
+
+def get_rep_counts(rep_name: str) -> dict[str, int]:
+    """
+    Returns {"daily": n, "monthly": n, "ytd": n}
+    computed from the sheet so manual deletions are reflected.
+    """
+    rows = fetch_sales_rows()
+    daily = compute_counts(rows, mode="daily").get(rep_name, 0)
+    monthly = compute_counts(rows, mode="monthly").get(rep_name, 0)
+    ytd = compute_counts(rows, mode="ytd").get(rep_name, 0)
+    return {"daily": daily, "monthly": monthly, "ytd": ytd}
 
 # ===========================
-# DISCORD UI
+# DISCORD UI: SALE FLOW
 # ===========================
-
-# -------- Modal --------
 class CustomerModal(discord.ui.Modal, title="Enter Customer Name"):
     customer_name = discord.ui.TextInput(
         label="Customer Name",
         placeholder="John Doe",
-        required=True
+        required=True,
+        max_length=80
     )
 
-    def __init__(self, user_id):
+    def __init__(self, user_id: int):
         super().__init__()
         self.user_id = user_id
 
-    async def on_submit(self, interaction):
+    async def on_submit(self, interaction: discord.Interaction):
+        # Enforce #sales channel even after modal submit
+        if interaction.channel_id != SALES_CHANNEL_ID:
+            await interaction.response.send_message(
+                "This bot only works in the **#sales** channel.",
+                ephemeral=True
+            )
+            return
+
         embed = discord.Embed(
-            title="Customer Name Received",
-            description=f"**{self.customer_name.value}**\n\nSelect the ISP below:",
+            title="Customer received",
+            description=f"**{self.customer_name.value}**\n\nSelect ISP:",
             color=discord.Color.blurple()
         )
+
         await interaction.response.send_message(
             embed=embed,
             view=ISPButtons(self.customer_name.value, self.user_id),
             ephemeral=True
         )
 
-
-# -------- ISP Buttons --------
 class ISPButtons(discord.ui.View):
-    def __init__(self, customer_name, user_id):
+    def __init__(self, customer_name: str, user_id: int):
         super().__init__(timeout=120)
         self.customer_name = customer_name
         self.user_id = user_id
 
-    async def pick(self, interaction, isp):
+    async def pick(self, interaction: discord.Interaction, isp: str):
         embed = discord.Embed(
-            title="ISP Selected",
-            description=f"**{isp}** chosen.\n\nNow choose a plan:",
+            title="ISP selected",
+            description=f"**{isp}**\n\nChoose plan:",
             color=discord.Color.green()
         )
         await interaction.response.send_message(
@@ -101,33 +189,30 @@ class ISPButtons(discord.ui.View):
         )
 
     @discord.ui.button(label="Wire3", style=discord.ButtonStyle.primary)
-    async def wire3(self, i, b): await self.pick(i, "Wire3")
+    async def wire3(self, i: discord.Interaction, b: discord.ui.Button): await self.pick(i, "Wire3")
 
     @discord.ui.button(label="Brightspeed", style=discord.ButtonStyle.primary)
-    async def brightspeed(self, i, b): await self.pick(i, "Brightspeed")
+    async def brightspeed(self, i: discord.Interaction, b: discord.ui.Button): await self.pick(i, "Brightspeed")
 
     @discord.ui.button(label="Kinetic", style=discord.ButtonStyle.primary)
-    async def kinetic(self, i, b): await self.pick(i, "Kinetic")
+    async def kinetic(self, i: discord.Interaction, b: discord.ui.Button): await self.pick(i, "Kinetic")
 
     @discord.ui.button(label="Astound", style=discord.ButtonStyle.primary)
-    async def astound(self, i, b): await self.pick(i, "Astound")
+    async def astound(self, i: discord.Interaction, b: discord.ui.Button): await self.pick(i, "Astound")
 
     @discord.ui.button(label="Quantum", style=discord.ButtonStyle.primary)
-    async def quantum(self, i, b): await self.pick(i, "Quantum")
+    async def quantum(self, i: discord.Interaction, b: discord.ui.Button): await self.pick(i, "Quantum")
 
     @discord.ui.button(label="Bluepeak", style=discord.ButtonStyle.primary)
-    async def bluepeak(self, i, b): await self.pick(i, "Bluepeak")
+    async def bluepeak(self, i: discord.Interaction, b: discord.ui.Button): await self.pick(i, "Bluepeak")
 
-
-# -------- Plan Dropdown --------
 class PlanDropdown(discord.ui.View):
-    def __init__(self, customer, isp, user_id):
+    def __init__(self, customer: str, isp: str, user_id: int):
         super().__init__(timeout=120)
         self.add_item(PlanSelect(customer, isp, user_id))
 
-
 class PlanSelect(discord.ui.Select):
-    def __init__(self, customer, isp, user_id):
+    def __init__(self, customer: str, isp: str, user_id: int):
         self.customer = customer
         self.isp = isp
         self.user_id = user_id
@@ -137,139 +222,153 @@ class PlanSelect(discord.ui.Select):
             discord.SelectOption(label="1G"),
             discord.SelectOption(label="1G+"),
         ]
+        super().__init__(placeholder="Choose a plan…", options=options, min_values=1, max_values=1)
 
-        super().__init__(placeholder="Choose a plan…", options=options)
-
-    async def callback(self, interaction):
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.channel_id != SALES_CHANNEL_ID:
+            await interaction.response.send_message(
+                "This bot only works in the **#sales** channel.",
+                ephemeral=True
+            )
+            return
 
         plan = self.values[0]
-        rep_id = self.user_id
         rep_name = interaction.user.display_name
 
-        # track daily
-        daily_sales.setdefault(rep_id, 0)
-        daily_sales[rep_id] += 1
-
-        # track all-time
-        add_all_time_sale(rep_id)
-
-        # google sheet
+        # 1) append to sheet
         append_sale_to_sheet(rep_name, self.customer, self.isp, plan)
 
+        # 2) fetch today's sales FROM SHEET (so deletions/cancels update counts)
+        counts = get_rep_counts(rep_name)
+
         # confirmation embed
-        embed = discord.Embed(
-            title="✅ Sale Logged!",
-            color=discord.Color.gold()
-        )
+        embed = discord.Embed(title="✅ Sale Logged!", color=discord.Color.gold())
         embed.add_field(name="Rep", value=rep_name, inline=False)
         embed.add_field(name="Customer", value=self.customer, inline=False)
         embed.add_field(name="ISP", value=self.isp, inline=True)
         embed.add_field(name="Plan", value=plan, inline=True)
-        embed.add_field(
-            name="Total All-Time Sales",
-            value=str(all_time_sales[rep_id]),
-            inline=False
-        )
-        embed.set_footer(text="Sale recorded successfully")
+        embed.add_field(name="Today's Sales", value=str(counts["daily"]), inline=False)
+        embed.set_footer(text="Logged to Google Sheets")
 
         await interaction.response.send_message(embed=embed, ephemeral=False)
 
+# ===========================
+# DISCORD UI: LEADERBOARD MODE SELECT
+# ===========================
+class LeaderboardModeSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Daily", value="daily", description="Today only"),
+            discord.SelectOption(label="Monthly", value="monthly", description="This month"),
+            discord.SelectOption(label="YTD", value="ytd", description="Year-to-date"),
+        ]
+        super().__init__(placeholder="Choose leaderboard timeframe…", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.channel_id != SALES_CHANNEL_ID:
+            await interaction.response.send_message(
+                "This bot only works in the **#sales** channel.",
+                ephemeral=True
+            )
+            return
+
+        mode = self.values[0]
+        await interaction.response.defer()  # avoid "interaction failed" while we fetch sheet
+
+        rows = fetch_sales_rows()
+        counts = compute_counts(rows, mode=mode)
+
+        if not counts:
+            await interaction.followup.send("No sales found for that timeframe.", ephemeral=True)
+            return
+
+        sorted_reps = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+
+        title_map = {"daily": "🏆 Daily Leaderboard", "monthly": "🏆 Monthly Leaderboard", "ytd": "🏆 YTD Leaderboard"}
+        embed = discord.Embed(title=title_map.get(mode, "🏆 Leaderboard"), color=discord.Color.gold())
+
+        medals = ["🥇", "🥈", "🥉"]
+        for idx, (rep, total) in enumerate(sorted_reps[:25], start=1):
+            rank_icon = medals[idx - 1] if idx <= 3 else f"#{idx}"
+            embed.add_field(name=f"{rank_icon} {rep}", value=f"**{total}** sales", inline=False)
+
+        embed.set_footer(text="Counts pulled from Google Sheets")
+        await interaction.followup.send(embed=embed)
+
+class LeaderboardView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+        self.add_item(LeaderboardModeSelect())
 
 # ===========================
 # BOT SETUP
 # ===========================
 intents = discord.Intents.default()
-intents.members = True   # IMPORTANT for leaderboard names
+intents.members = True  # for general usefulness; counts use sheet rep names anyway
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-
 
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    await bot.tree.sync(guild=None)   # force global refresh
     print(f"Bot is live as {bot.user}")
-
-
 
 # ===========================
 # SLASH COMMANDS
 # ===========================
-
-# ----- SALE -----
-@bot.tree.command(name="sale", description="Log a new sale")
-async def sale(interaction):
+@bot.tree.command(name="sale", description="Log a new sale (sales channel only)")
+async def sale(interaction: discord.Interaction):
+    if not await require_sales_channel(interaction):
+        return
     await interaction.response.send_modal(CustomerModal(interaction.user.id))
 
-
-# ----- MY SALES -----
-@bot.tree.command(name="mysales", description="View your sales today")
-async def mysales(interaction):
-    rep_id = interaction.user.id
-    count = daily_sales.get(rep_id, 0)
+@bot.tree.command(name="leaderboard", description="Show leaderboard: Daily, Monthly, or YTD (sales channel only)")
+async def leaderboard(interaction: discord.Interaction):
+    if not await require_sales_channel(interaction):
+        return
 
     embed = discord.Embed(
-        title="📊 Your Sales Today",
-        description=f"You have **{count}** sales today.",
-        color=discord.Color.blue()
+        title="Leaderboard",
+        description="Pick a timeframe:",
+        color=discord.Color.blurple()
     )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=LeaderboardView(), ephemeral=True)
 
+@bot.tree.command(name="mysales", description="View your sales: Daily, Monthly, YTD (sales channel only)")
+async def mysales(interaction: discord.Interaction):
+    if not await require_sales_channel(interaction):
+        return
 
-# ----- LEADERBOARD (ALL TIME) -----
-@bot.tree.command(name="leaderboard", description="All-time leaderboard")
-async def leaderboard(interaction):
+    await interaction.response.defer(ephemeral=True)
 
-    if not all_time_sales:
-        return await interaction.response.send_message(
-            "No sales recorded yet."
-        )
+    rep_name = interaction.user.display_name
+    counts = get_rep_counts(rep_name)
 
-    sorted_reps = sorted(all_time_sales.items(), key=lambda x: x[1], reverse=True)
+    embed = discord.Embed(title="📊 Your Sales", color=discord.Color.blue())
+    embed.add_field(name="Daily", value=str(counts["daily"]), inline=True)
+    embed.add_field(name="Monthly", value=str(counts["monthly"]), inline=True)
+    embed.add_field(name="YTD", value=str(counts["ytd"]), inline=True)
+    embed.set_footer(text="Counts pulled from Google Sheets")
 
-    embed = discord.Embed(
-        title="🏆 All-Time Sales Leaderboard",
-        color=discord.Color.gold()
-    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
-    medals = ["🥇", "🥈", "🥉"]
-
-    for i, (uid, total) in enumerate(sorted_reps, start=1):
-        member = interaction.guild.get_member(uid)
-        name = member.display_name if member else "Unknown"
-
-        rank_icon = medals[i-1] if i <= 3 else f"#{i}"
-
-        embed.add_field(
-            name=f"{rank_icon} {name}",
-            value=f"**{total}** sales",
-            inline=False
-        )
-
-    await interaction.response.send_message(embed=embed)
-
-
-# ----- RESET -----
-@bot.tree.command(name="reset", description="Reset all sales")
-async def reset(interaction):
+@bot.tree.command(name="reset", description="Reset bot (admin only) — does NOT delete Google Sheet rows")
+async def reset(interaction: discord.Interaction):
+    if not await require_sales_channel(interaction):
+        return
 
     if not interaction.user.guild_permissions.administrator:
-        return await interaction.response.send_message(
-            "Admin only.", ephemeral=True
-        )
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
 
-    global daily_sales, all_time_sales
-    daily_sales = {}
-    all_time_sales = {}
-
+    # Since we now treat the sheet as source of truth,
+    # reset only clears any transient views/state (none critical).
     embed = discord.Embed(
-        title="🧹 Sales Reset",
-        description="All sales have been cleared.",
+        title="🧹 Reset complete",
+        description="Bot state reset. Google Sheet data was NOT changed.",
         color=discord.Color.red()
     )
-
-    await interaction.response.send_message(embed=embed)
-
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ===========================
 # RUN BOT
