@@ -2,18 +2,22 @@ import os
 import json
 import discord
 from discord.ext import commands
-from discord import app_commands
 from datetime import datetime, timezone
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+
+
 # ===========================
 # ENVIRONMENT VARIABLES
 # ===========================
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-SALES_CHANNEL_ID = int(os.getenv("SALES_CHANNEL_ID", "0"))  # REQUIRED
+
+SALES_CHANNEL_ID = int(os.getenv("SALES_CHANNEL_ID", "0"))         # REQUIRED
+MANAGERS_CHANNEL_ID = int(os.getenv("MANAGERS_CHANNEL_ID", "0"))   # REQUIRED
 
 if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN env var.")
@@ -23,6 +27,10 @@ if not os.getenv("GOOGLE_SERVICE_JSON"):
     raise RuntimeError("Missing GOOGLE_SERVICE_JSON env var.")
 if SALES_CHANNEL_ID == 0:
     raise RuntimeError("Missing/invalid SALES_CHANNEL_ID env var.")
+if MANAGERS_CHANNEL_ID == 0:
+    raise RuntimeError("Missing/invalid MANAGERS_CHANNEL_ID env var.")
+
+ALLOWED_CHANNEL_IDS = {SALES_CHANNEL_ID, MANAGERS_CHANNEL_ID}
 
 service_info = json.loads(os.getenv("GOOGLE_SERVICE_JSON"))
 credentials = service_account.Credentials.from_service_account_info(
@@ -37,11 +45,11 @@ SHEET_RANGE = "Sheet1!A:E"  # Timestamp | RepName | Customer | ISP | Plan
 # ===========================
 # HELPERS: CHANNEL GATING
 # ===========================
-async def require_sales_channel(interaction: discord.Interaction) -> bool:
-    """Return True if ok, otherwise respond and return False."""
-    if interaction.channel_id != SALES_CHANNEL_ID:
+async def require_allowed_channel(interaction: discord.Interaction) -> bool:
+    """Allow only #sales or #managers. Return True if ok, else respond and return False."""
+    if interaction.channel_id not in ALLOWED_CHANNEL_IDS:
         await interaction.response.send_message(
-            "This bot only works in the **#sales** channel.",
+            "This bot only works in **#sales** or **#managers**.",
             ephemeral=True
         )
         return False
@@ -60,7 +68,7 @@ def append_sale_to_sheet(rep_name: str, customer: str, isp: str, plan: str):
         body={"values": row},
     ).execute()
 
-def _parse_utc_timestamp(ts_str: str) -> datetime | None:
+def _parse_utc_timestamp(ts_str: str):
     """
     Expects: 'YYYY-MM-DD HH:MM:SS UTC'
     Returns aware datetime in UTC or None if parsing fails.
@@ -71,7 +79,7 @@ def _parse_utc_timestamp(ts_str: str) -> datetime | None:
     except Exception:
         return None
 
-def fetch_sales_rows() -> list[list[str]]:
+def fetch_sales_rows():
     """
     Returns all rows excluding header (if present).
     """
@@ -92,17 +100,18 @@ def fetch_sales_rows() -> list[list[str]]:
 
     return values
 
-def compute_counts(rows: list[list[str]], *, mode: str) -> dict[str, int]:
+def compute_counts(rows, *, mode: str):
     """
     mode in {"daily","monthly","ytd","all"}
     Uses RepName (col B) and Timestamp (col A).
     """
     now = datetime.now(timezone.utc)
-    counts: dict[str, int] = {}
+    counts = {}
 
     for r in rows:
         if len(r) < 2:
             continue
+
         ts = _parse_utc_timestamp(r[0]) if len(r) >= 1 else None
         rep = r[1].strip() if len(r) >= 2 else ""
         if not rep or not ts:
@@ -123,7 +132,7 @@ def compute_counts(rows: list[list[str]], *, mode: str) -> dict[str, int]:
 
     return counts
 
-def get_rep_counts(rep_name: str) -> dict[str, int]:
+def get_rep_counts(rep_name: str):
     """
     Returns {"daily": n, "monthly": n, "ytd": n}
     computed from the sheet so manual deletions are reflected.
@@ -150,12 +159,8 @@ class CustomerModal(discord.ui.Modal, title="Enter Customer Name"):
         self.user_id = user_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Enforce #sales channel even after modal submit
-        if interaction.channel_id != SALES_CHANNEL_ID:
-            await interaction.response.send_message(
-                "This bot only works in the **#sales** channel.",
-                ephemeral=True
-            )
+        # Enforce allowed channels even after modal submit
+        if not await require_allowed_channel(interaction):
             return
 
         embed = discord.Embed(
@@ -177,6 +182,9 @@ class ISPButtons(discord.ui.View):
         self.user_id = user_id
 
     async def pick(self, interaction: discord.Interaction, isp: str):
+        if not await require_allowed_channel(interaction):
+            return
+
         embed = discord.Embed(
             title="ISP selected",
             description=f"**{isp}**\n\nChoose plan:",
@@ -189,22 +197,28 @@ class ISPButtons(discord.ui.View):
         )
 
     @discord.ui.button(label="Wire3", style=discord.ButtonStyle.primary)
-    async def wire3(self, i: discord.Interaction, b: discord.ui.Button): await self.pick(i, "Wire3")
+    async def wire3(self, i: discord.Interaction, b: discord.ui.Button):
+        await self.pick(i, "Wire3")
 
     @discord.ui.button(label="Brightspeed", style=discord.ButtonStyle.primary)
-    async def brightspeed(self, i: discord.Interaction, b: discord.ui.Button): await self.pick(i, "Brightspeed")
+    async def brightspeed(self, i: discord.Interaction, b: discord.ui.Button):
+        await self.pick(i, "Brightspeed")
 
     @discord.ui.button(label="Kinetic", style=discord.ButtonStyle.primary)
-    async def kinetic(self, i: discord.Interaction, b: discord.ui.Button): await self.pick(i, "Kinetic")
+    async def kinetic(self, i: discord.Interaction, b: discord.ui.Button):
+        await self.pick(i, "Kinetic")
 
     @discord.ui.button(label="Astound", style=discord.ButtonStyle.primary)
-    async def astound(self, i: discord.Interaction, b: discord.ui.Button): await self.pick(i, "Astound")
+    async def astound(self, i: discord.Interaction, b: discord.ui.Button):
+        await self.pick(i, "Astound")
 
     @discord.ui.button(label="Quantum", style=discord.ButtonStyle.primary)
-    async def quantum(self, i: discord.Interaction, b: discord.ui.Button): await self.pick(i, "Quantum")
+    async def quantum(self, i: discord.Interaction, b: discord.ui.Button):
+        await self.pick(i, "Quantum")
 
     @discord.ui.button(label="Bluepeak", style=discord.ButtonStyle.primary)
-    async def bluepeak(self, i: discord.Interaction, b: discord.ui.Button): await self.pick(i, "Bluepeak")
+    async def bluepeak(self, i: discord.Interaction, b: discord.ui.Button):
+        await self.pick(i, "Bluepeak")
 
 class PlanDropdown(discord.ui.View):
     def __init__(self, customer: str, isp: str, user_id: int):
@@ -222,14 +236,15 @@ class PlanSelect(discord.ui.Select):
             discord.SelectOption(label="1G"),
             discord.SelectOption(label="1G+"),
         ]
-        super().__init__(placeholder="Choose a plan…", options=options, min_values=1, max_values=1)
+        super().__init__(
+            placeholder="Choose a plan…",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
 
     async def callback(self, interaction: discord.Interaction):
-        if interaction.channel_id != SALES_CHANNEL_ID:
-            await interaction.response.send_message(
-                "This bot only works in the **#sales** channel.",
-                ephemeral=True
-            )
+        if not await require_allowed_channel(interaction):
             return
 
         plan = self.values[0]
@@ -262,14 +277,15 @@ class LeaderboardModeSelect(discord.ui.Select):
             discord.SelectOption(label="Monthly", value="monthly", description="This month"),
             discord.SelectOption(label="YTD", value="ytd", description="Year-to-date"),
         ]
-        super().__init__(placeholder="Choose leaderboard timeframe…", options=options, min_values=1, max_values=1)
+        super().__init__(
+            placeholder="Choose leaderboard timeframe…",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
 
     async def callback(self, interaction: discord.Interaction):
-        if interaction.channel_id != SALES_CHANNEL_ID:
-            await interaction.response.send_message(
-                "This bot only works in the **#sales** channel.",
-                ephemeral=True
-            )
+        if not await require_allowed_channel(interaction):
             return
 
         mode = self.values[0]
@@ -284,7 +300,11 @@ class LeaderboardModeSelect(discord.ui.Select):
 
         sorted_reps = sorted(counts.items(), key=lambda x: x[1], reverse=True)
 
-        title_map = {"daily": "🏆 Daily Leaderboard", "monthly": "🏆 Monthly Leaderboard", "ytd": "🏆 YTD Leaderboard"}
+        title_map = {
+            "daily": "🏆 Daily Leaderboard",
+            "monthly": "🏆 Monthly Leaderboard",
+            "ytd": "🏆 YTD Leaderboard",
+        }
         embed = discord.Embed(title=title_map.get(mode, "🏆 Leaderboard"), color=discord.Color.gold())
 
         medals = ["🥇", "🥈", "🥉"]
@@ -308,23 +328,31 @@ intents.members = True  # for general usefulness; counts use sheet rep names any
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0"))
+
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
-    print(f"Bot is live as {bot.user}")
+    if DEV_GUILD_ID:
+        guild = discord.Object(id=DEV_GUILD_ID)
+        await bot.tree.sync(guild=guild)
+        print(f"Bot is live as {bot.user} (guild sync)")
+    else:
+        await bot.tree.sync()
+        print(f"Bot is live as {bot.user} (global sync)")
+
 
 # ===========================
 # SLASH COMMANDS
 # ===========================
-@bot.tree.command(name="sale", description="Log a new sale (sales channel only)")
+@bot.tree.command(name="sale", description="Log a new sale (#sales or #managers)")
 async def sale(interaction: discord.Interaction):
-    if not await require_sales_channel(interaction):
+    if not await require_allowed_channel(interaction):
         return
     await interaction.response.send_modal(CustomerModal(interaction.user.id))
 
-@bot.tree.command(name="leaderboard", description="Show leaderboard: Daily, Monthly, or YTD (sales channel only)")
+@bot.tree.command(name="leaderboard", description="Show leaderboard: Daily, Monthly, or YTD (#sales or #managers)")
 async def leaderboard(interaction: discord.Interaction):
-    if not await require_sales_channel(interaction):
+    if not await require_allowed_channel(interaction):
         return
 
     embed = discord.Embed(
@@ -334,9 +362,9 @@ async def leaderboard(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, view=LeaderboardView(), ephemeral=True)
 
-@bot.tree.command(name="mysales", description="View your sales: Daily, Monthly, YTD (sales channel only)")
+@bot.tree.command(name="mysales", description="View your sales: Daily, Monthly, YTD (#sales or #managers)")
 async def mysales(interaction: discord.Interaction):
-    if not await require_sales_channel(interaction):
+    if not await require_allowed_channel(interaction):
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -354,15 +382,13 @@ async def mysales(interaction: discord.Interaction):
 
 @bot.tree.command(name="reset", description="Reset bot (admin only) — does NOT delete Google Sheet rows")
 async def reset(interaction: discord.Interaction):
-    if not await require_sales_channel(interaction):
+    if not await require_allowed_channel(interaction):
         return
 
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admin only.", ephemeral=True)
         return
 
-    # Since we now treat the sheet as source of truth,
-    # reset only clears any transient views/state (none critical).
     embed = discord.Embed(
         title="🧹 Reset complete",
         description="Bot state reset. Google Sheet data was NOT changed.",
