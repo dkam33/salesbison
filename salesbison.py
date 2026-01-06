@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("America/New_York")
 
 
 # ===========================
@@ -59,7 +62,7 @@ async def require_allowed_channel(interaction: discord.Interaction) -> bool:
 # GOOGLE SHEETS: APPEND + READ COUNTS
 # ===========================
 def append_sale_to_sheet(rep_name: str, customer: str, isp: str, plan: str):
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
     row = [[ts, rep_name, customer, isp, plan]]
     sheet_api.append(
         spreadsheetId=GOOGLE_SHEET_ID,
@@ -68,14 +71,14 @@ def append_sale_to_sheet(rep_name: str, customer: str, isp: str, plan: str):
         body={"values": row},
     ).execute()
 
-def _parse_utc_timestamp(ts_str: str):
+def _parse_et_timestamp(ts_str: str):
     """
-    Expects: 'YYYY-MM-DD HH:MM:SS UTC'
-    Returns aware datetime in UTC or None if parsing fails.
+    Expects: 'YYYY-MM-DD HH:MM:SS ET'
+    Returns aware datetime in ET or None if parsing fails.
     """
     try:
-        dt = datetime.strptime(ts_str.strip(), "%Y-%m-%d %H:%M:%S UTC")
-        return dt.replace(tzinfo=timezone.utc)
+        dt = datetime.strptime(ts_str.strip(), "%Y-%m-%d %H:%M:%S ET")
+        return dt.replace(tzinfo=ET)
     except Exception:
         return None
 
@@ -105,14 +108,14 @@ def compute_counts(rows, *, mode: str):
     mode in {"daily","monthly","ytd","all"}
     Uses RepName (col B) and Timestamp (col A).
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(ET)
     counts = {}
 
     for r in rows:
         if len(r) < 2:
             continue
 
-        ts = _parse_utc_timestamp(r[0]) if len(r) >= 1 else None
+        ts = _parse_et_timestamp(r[0]) if len(r) >= 1 else None
         rep = r[1].strip() if len(r) >= 2 else ""
         if not rep or not ts:
             continue
