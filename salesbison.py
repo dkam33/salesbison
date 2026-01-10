@@ -203,6 +203,10 @@ class ISPButtons(discord.ui.View):
     async def wire3(self, i: discord.Interaction, b: discord.ui.Button):
         await self.pick(i, "Wire3")
 
+    @discord.ui.button(label="Omni", style=discord.ButtonStyle.primary)
+    async def Omni(self, i: discord.Interaction, b: discord.ui.Button):
+        await self.pick(i, "Omni")
+
     @discord.ui.button(label="Brightspeed", style=discord.ButtonStyle.primary)
     async def brightspeed(self, i: discord.Interaction, b: discord.ui.Button):
         await self.pick(i, "Brightspeed")
