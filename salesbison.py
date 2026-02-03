@@ -410,7 +410,6 @@ class PlanSelect(discord.ui.Select):
 
         embed = discord.Embed(title="✅ Sale Logged!", color=discord.Color.gold())
         embed.add_field(name="Rep", value=rep_name, inline=False)
-        embed.add_field(name="Manager", value=manager, inline=False)
         embed.add_field(name="Customer", value=self.customer, inline=False)
         embed.add_field(name="ISP", value=self.isp, inline=True)
         embed.add_field(name="Plan", value=plan, inline=True)
