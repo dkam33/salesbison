@@ -1,6 +1,5 @@
 import os
 import json
-import time
 import discord
 from discord.ext import commands
 from datetime import datetime, timezone
@@ -112,9 +111,7 @@ def _parse_et_timestamp(ts_str: str):
 # READ SALES ROWS
 # ===========================
 def fetch_sales_rows():
-    """
-    Returns all rows excluding header (if present).
-    """
+    """Returns all rows excluding header (if present)."""
     resp = sheet_api.get(
         spreadsheetId=GOOGLE_SHEET_ID,
         range=SHEET_RANGE
@@ -124,9 +121,12 @@ def fetch_sales_rows():
     if not values:
         return []
 
-    # If first row looks like a header, drop it
-    first = [c.strip().lower() for c in values[0]]
-    header_like = ("timestamp" in first[0]) or ("rep" in "".join(first))
+    # Safe header detection
+    first_row = values[0] if values else []
+    first = [str(c).strip().lower() for c in first_row] if first_row else []
+    header_like = False
+    if first:
+        header_like = ("timestamp" in first[0]) or ("rep" in "".join(first))
     if header_like:
         values = values[1:]
 
@@ -156,7 +156,7 @@ def compute_counts(rows, *, mode: str, key: str = "rep"):
         if len(r) < 4:
             continue
 
-        ts = _parse_et_timestamp(r[0])
+        ts = _parse_et_timestamp(str(r[0]))
         rep_id = str(r[1]).strip()
         rep_name = str(r[2]).strip()
         manager = str(r[3]).strip()
@@ -180,7 +180,7 @@ def compute_counts(rows, *, mode: str, key: str = "rep"):
         if key == "manager":
             k = manager or "Unassigned"
         else:
-            # Prefer stable rep_id; fallback to name if needed
+            # Use stable RepId for grouping
             k = rep_id if rep_id else rep_name
 
         counts[k] = counts.get(k, 0) + 1
@@ -188,10 +188,7 @@ def compute_counts(rows, *, mode: str, key: str = "rep"):
     return counts
 
 def get_rep_counts(rep_id: int):
-    """
-    Returns {"daily": n, "monthly": n, "ytd": n}
-    computed from the sheet so manual deletions are reflected.
-    """
+    """Returns {"daily": n, "monthly": n, "ytd": n} computed from the sheet."""
     rows = fetch_sales_rows()
     rep_key = str(rep_id)
     daily = compute_counts(rows, mode="daily", key="rep").get(rep_key, 0)
@@ -200,7 +197,7 @@ def get_rep_counts(rep_id: int):
     return {"daily": daily, "monthly": monthly, "ytd": ytd}
 
 # ===========================
-# ROSTER LOOKUP (RepId -> Manager)
+# ROSTER LOOKUP (RepId -> Manager / RepName)
 # ===========================
 _ROSTER_CACHE = {"ts": 0, "map": {}}
 _ROSTER_TTL_SECONDS = 120  # refresh every 2 minutes
@@ -223,8 +220,9 @@ def build_roster_map(values):
     if not values:
         return {}
 
-    # Drop header if present
-    first = [c.strip().lower() for c in values[0]]
+    # Safe header detection
+    first_row = values[0] if values else []
+    first = [str(c).strip().lower() for c in first_row] if first_row else []
     if first and ("repid" in first[0] or "manager" in "".join(first)):
         values = values[1:]
 
@@ -269,37 +267,15 @@ def lookup_manager_for_rep(rep_id: int):
         return None
     return info.get("manager")
 
-# ===========================
-# REP NAME RESOLUTION (RepId -> RepName)
-# ===========================
 def get_rep_name_map():
-    """
-    Builds a RepId -> RepName map.
-    Priority:
-      1) Roster sheet
-      2) Sales log rows (fallback)
-    """
+    """RepId -> RepName map from Roster only (fast + stable)."""
     rep_map = {}
-
-    # 1) From roster (authoritative)
     roster = get_roster_map_cached()
     for rep_id, info in roster.items():
-        name = info.get("rep_name")
+        name = (info.get("rep_name") or "").strip()
         if name:
             rep_map[str(rep_id)] = name
-
-    # 2) Fallback: infer from sales rows
-    rows = fetch_sales_rows()
-    for r in rows:
-        if len(r) < 3:
-            continue
-        rep_id = str(r[1]).strip()
-        rep_name = str(r[2]).strip()
-        if rep_id and rep_name and rep_id not in rep_map:
-            rep_map[rep_id] = rep_name
-
     return rep_map
-
 
 # ===========================
 # DISCORD UI: SALE FLOW
@@ -421,7 +397,6 @@ class PlanSelect(discord.ui.Select):
             )
             return
 
-        # 1) append to sheet
         try:
             append_sale_to_sheet(rep_id, rep_name, manager, self.customer, self.isp, plan)
         except Exception as e:
@@ -431,12 +406,11 @@ class PlanSelect(discord.ui.Select):
             )
             return
 
-        # 2) fetch today's sales FROM SHEET (so deletions/cancels update counts)
         counts = get_rep_counts(rep_id)
 
-        # confirmation embed
         embed = discord.Embed(title="✅ Sale Logged!", color=discord.Color.gold())
         embed.add_field(name="Rep", value=rep_name, inline=False)
+        embed.add_field(name="Manager", value=manager, inline=False)
         embed.add_field(name="Customer", value=self.customer, inline=False)
         embed.add_field(name="ISP", value=self.isp, inline=True)
         embed.add_field(name="Plan", value=plan, inline=True)
@@ -467,7 +441,7 @@ class LeaderboardModeSelect(discord.ui.Select):
             return
 
         mode = self.values[0]
-        await interaction.response.defer()  # avoid "interaction failed" while we fetch sheet
+        await interaction.response.defer()  # not ephemeral so it posts normally
 
         rows = fetch_sales_rows()
         counts = compute_counts(rows, mode=mode, key="rep")
@@ -476,6 +450,7 @@ class LeaderboardModeSelect(discord.ui.Select):
             await interaction.followup.send("No sales found for that timeframe.", ephemeral=True)
             return
 
+        rep_name_map = get_rep_name_map()
         sorted_reps = sorted(counts.items(), key=lambda x: x[1], reverse=True)
 
         title_map = {
@@ -485,18 +460,11 @@ class LeaderboardModeSelect(discord.ui.Select):
         }
         embed = discord.Embed(title=title_map.get(mode, "🏆 Leaderboard"), color=discord.Color.gold())
 
-        def get_rep_name_map():
-    """
-    RepId -> RepName map from Roster only (authoritative + fast).
-    """
-    rep_map = {}
-    roster = get_roster_map_cached()
-    for rep_id, info in roster.items():
-        name = (info.get("rep_name") or "").strip()
-        if name:
-            rep_map[str(rep_id)] = name
-    return rep_map
-
+        medals = ["🥇", "🥈", "🥉"]
+        for idx, (rep_id_str, total) in enumerate(sorted_reps[:25], start=1):
+            rank_icon = medals[idx - 1] if idx <= 3 else f"#{idx}"
+            display_name = rep_name_map.get(str(rep_id_str), f"Unknown ({rep_id_str})")
+            embed.add_field(name=f"{rank_icon} {display_name}", value=f"**{total}** sales", inline=False)
 
         embed.set_footer(text="Counts pulled from Google Sheets")
         await interaction.followup.send(embed=embed)
@@ -652,3 +620,4 @@ async def reset(interaction: discord.Interaction):
 # RUN BOT
 # ===========================
 bot.run(TOKEN)
+
