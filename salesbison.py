@@ -270,6 +270,38 @@ def lookup_manager_for_rep(rep_id: int):
     return info.get("manager")
 
 # ===========================
+# REP NAME RESOLUTION (RepId -> RepName)
+# ===========================
+def get_rep_name_map():
+    """
+    Builds a RepId -> RepName map.
+    Priority:
+      1) Roster sheet
+      2) Sales log rows (fallback)
+    """
+    rep_map = {}
+
+    # 1) From roster (authoritative)
+    roster = get_roster_map_cached()
+    for rep_id, info in roster.items():
+        name = info.get("rep_name")
+        if name:
+            rep_map[str(rep_id)] = name
+
+    # 2) Fallback: infer from sales rows
+    rows = fetch_sales_rows()
+    for r in rows:
+        if len(r) < 3:
+            continue
+        rep_id = str(r[1]).strip()
+        rep_name = str(r[2]).strip()
+        if rep_id and rep_name and rep_id not in rep_map:
+            rep_map[rep_id] = rep_name
+
+    return rep_map
+
+
+# ===========================
 # DISCORD UI: SALE FLOW
 # ===========================
 class CustomerModal(discord.ui.Modal, title="Enter Customer Name"):
@@ -453,11 +485,17 @@ class LeaderboardModeSelect(discord.ui.Select):
         }
         embed = discord.Embed(title=title_map.get(mode, "🏆 Leaderboard"), color=discord.Color.gold())
 
-        medals = ["🥇", "🥈", "🥉"]
-        for idx, (rep_key, total) in enumerate(sorted_reps[:25], start=1):
+        rep_name_map = get_rep_name_map()
+
+        for idx, (rep_id, total) in enumerate(sorted_reps[:25], start=1):
             rank_icon = medals[idx - 1] if idx <= 3 else f"#{idx}"
-            # rep_key is RepId; display the key directly unless you want to map RepId->name
-            embed.add_field(name=f"{rank_icon} {rep_key}", value=f"**{total}** sales", inline=False)
+            display_name = rep_name_map.get(str(rep_id), f"Unknown ({rep_id})")
+
+            embed.add_field(
+                name=f"{rank_icon} {display_name}",
+                value=f"**{total}** sales",
+                inline=False)
+
 
         embed.set_footer(text="Counts pulled from Google Sheets")
         await interaction.followup.send(embed=embed)
