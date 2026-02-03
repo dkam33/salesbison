@@ -485,16 +485,17 @@ class LeaderboardModeSelect(discord.ui.Select):
         }
         embed = discord.Embed(title=title_map.get(mode, "🏆 Leaderboard"), color=discord.Color.gold())
 
-        rep_name_map = get_rep_name_map()
-
-        for idx, (rep_id, total) in enumerate(sorted_reps[:25], start=1):
-            rank_icon = medals[idx - 1] if idx <= 3 else f"#{idx}"
-            display_name = rep_name_map.get(str(rep_id), f"Unknown ({rep_id})")
-
-            embed.add_field(
-                name=f"{rank_icon} {display_name}",
-                value=f"**{total}** sales",
-                inline=False)
+        def get_rep_name_map():
+    """
+    RepId -> RepName map from Roster only (authoritative + fast).
+    """
+    rep_map = {}
+    roster = get_roster_map_cached()
+    for rep_id, info in roster.items():
+        name = (info.get("rep_name") or "").strip()
+        if name:
+            rep_map[str(rep_id)] = name
+    return rep_map
 
 
         embed.set_footer(text="Counts pulled from Google Sheets")
