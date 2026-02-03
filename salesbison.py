@@ -1,26 +1,28 @@
 import os
 import json
+import time
 import discord
 from discord.ext import commands
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-from zoneinfo import ZoneInfo
-
+# ===========================
+# TIMEZONE
+# ===========================
 ET = ZoneInfo("America/New_York")
-
 
 # ===========================
 # ENVIRONMENT VARIABLES
 # ===========================
-
 TOKEN = os.getenv("DISCORD_TOKEN")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
 SALES_CHANNEL_ID = int(os.getenv("SALES_CHANNEL_ID", "0"))         # REQUIRED
 MANAGERS_CHANNEL_ID = int(os.getenv("MANAGERS_CHANNEL_ID", "0"))   # REQUIRED
+DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0"))                # Optional: faster command sync during dev
 
 if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN env var.")
@@ -35,6 +37,9 @@ if MANAGERS_CHANNEL_ID == 0:
 
 ALLOWED_CHANNEL_IDS = {SALES_CHANNEL_ID, MANAGERS_CHANNEL_ID}
 
+# ===========================
+# GOOGLE SHEETS CLIENT
+# ===========================
 service_info = json.loads(os.getenv("GOOGLE_SERVICE_JSON"))
 credentials = service_account.Credentials.from_service_account_info(
     service_info,
@@ -43,7 +48,25 @@ credentials = service_account.Credentials.from_service_account_info(
 sheets_service = build("sheets", "v4", credentials=credentials)
 sheet_api = sheets_service.spreadsheets().values()
 
-SHEET_RANGE = "Sheet1!A:E"  # Timestamp | RepName | Customer | ISP | Plan
+# ===========================
+# SHEET RANGES / SCHEMA
+# ===========================
+# Sheet1 columns:
+#   A Timestamp
+#   B RepId
+#   C RepName
+#   D Manager
+#   E Customer
+#   F ISP
+#   G Plan
+SHEET_RANGE = "Sheet1!A:G"
+
+# Roster columns:
+#   A RepId
+#   B RepName
+#   C Manager
+#   D Active (TRUE/FALSE)
+ROSTER_RANGE = "Roster!A:D"
 
 # ===========================
 # HELPERS: CHANNEL GATING
@@ -52,18 +75,18 @@ async def require_allowed_channel(interaction: discord.Interaction) -> bool:
     """Allow only #sales or #managers. Return True if ok, else respond and return False."""
     if interaction.channel_id not in ALLOWED_CHANNEL_IDS:
         await interaction.response.send_message(
-            "This bot only works in **#sales** or **#managers**.",
+            f"This bot only works in <#{SALES_CHANNEL_ID}> or <#{MANAGERS_CHANNEL_ID}>.",
             ephemeral=True
         )
         return False
     return True
 
 # ===========================
-# GOOGLE SHEETS: APPEND + READ COUNTS
+# GOOGLE SHEETS: APPEND
 # ===========================
-def append_sale_to_sheet(rep_name: str, customer: str, isp: str, plan: str):
+def append_sale_to_sheet(rep_id: int, rep_name: str, manager: str, customer: str, isp: str, plan: str):
     ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
-    row = [[ts, rep_name, customer, isp, plan]]
+    row = [[ts, str(rep_id), rep_name, manager, customer, isp, plan]]
     sheet_api.append(
         spreadsheetId=GOOGLE_SHEET_ID,
         range=SHEET_RANGE,
@@ -71,6 +94,9 @@ def append_sale_to_sheet(rep_name: str, customer: str, isp: str, plan: str):
         body={"values": row},
     ).execute()
 
+# ===========================
+# TIMESTAMP PARSING
+# ===========================
 def _parse_et_timestamp(ts_str: str):
     """
     Expects: 'YYYY-MM-DD HH:MM:SS ET'
@@ -82,6 +108,9 @@ def _parse_et_timestamp(ts_str: str):
     except Exception:
         return None
 
+# ===========================
+# READ SALES ROWS
+# ===========================
 def fetch_sales_rows():
     """
     Returns all rows excluding header (if present).
@@ -103,21 +132,36 @@ def fetch_sales_rows():
 
     return values
 
-def compute_counts(rows, *, mode: str):
+# ===========================
+# COUNTS
+# ===========================
+def compute_counts(rows, *, mode: str, key: str = "rep"):
     """
     mode in {"daily","monthly","ytd","all"}
-    Uses RepName (col B) and Timestamp (col A).
+    key in {"rep","manager"} determines grouping.
+
+    Columns (Sheet1):
+      A Timestamp
+      B RepId
+      C RepName
+      D Manager
+      E Customer
+      F ISP
+      G Plan
     """
     now = datetime.now(ET)
     counts = {}
 
     for r in rows:
-        if len(r) < 2:
+        if len(r) < 4:
             continue
 
-        ts = _parse_et_timestamp(r[0]) if len(r) >= 1 else None
-        rep = r[1].strip() if len(r) >= 2 else ""
-        if not rep or not ts:
+        ts = _parse_et_timestamp(r[0])
+        rep_id = str(r[1]).strip()
+        rep_name = str(r[2]).strip()
+        manager = str(r[3]).strip()
+
+        if not ts:
             continue
 
         include = False
@@ -130,21 +174,100 @@ def compute_counts(rows, *, mode: str):
         elif mode == "ytd":
             include = (ts.year == now.year)
 
-        if include:
-            counts[rep] = counts.get(rep, 0) + 1
+        if not include:
+            continue
+
+        if key == "manager":
+            k = manager or "Unassigned"
+        else:
+            # Prefer stable rep_id; fallback to name if needed
+            k = rep_id if rep_id else rep_name
+
+        counts[k] = counts.get(k, 0) + 1
 
     return counts
 
-def get_rep_counts(rep_name: str):
+def get_rep_counts(rep_id: int):
     """
     Returns {"daily": n, "monthly": n, "ytd": n}
     computed from the sheet so manual deletions are reflected.
     """
     rows = fetch_sales_rows()
-    daily = compute_counts(rows, mode="daily").get(rep_name, 0)
-    monthly = compute_counts(rows, mode="monthly").get(rep_name, 0)
-    ytd = compute_counts(rows, mode="ytd").get(rep_name, 0)
+    rep_key = str(rep_id)
+    daily = compute_counts(rows, mode="daily", key="rep").get(rep_key, 0)
+    monthly = compute_counts(rows, mode="monthly", key="rep").get(rep_key, 0)
+    ytd = compute_counts(rows, mode="ytd", key="rep").get(rep_key, 0)
     return {"daily": daily, "monthly": monthly, "ytd": ytd}
+
+# ===========================
+# ROSTER LOOKUP (RepId -> Manager)
+# ===========================
+_ROSTER_CACHE = {"ts": 0, "map": {}}
+_ROSTER_TTL_SECONDS = 120  # refresh every 2 minutes
+
+def _now_unix():
+    return int(datetime.now(timezone.utc).timestamp())
+
+def fetch_roster_rows():
+    resp = sheet_api.get(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=ROSTER_RANGE
+    ).execute()
+    return resp.get("values", [])
+
+def build_roster_map(values):
+    """
+    Returns dict:
+      rep_id(int) -> {"rep_name": str, "manager": str, "active": bool}
+    """
+    if not values:
+        return {}
+
+    # Drop header if present
+    first = [c.strip().lower() for c in values[0]]
+    if first and ("repid" in first[0] or "manager" in "".join(first)):
+        values = values[1:]
+
+    out = {}
+    for row in values:
+        if len(row) < 3:
+            continue
+
+        rep_id_str = str(row[0]).strip()
+        rep_name = str(row[1]).strip() if len(row) >= 2 else ""
+        manager = str(row[2]).strip() if len(row) >= 3 else ""
+        active_raw = str(row[3]).strip().lower() if len(row) >= 4 else "true"
+
+        try:
+            rep_id = int(rep_id_str)
+        except Exception:
+            continue
+
+        active = active_raw not in ("false", "0", "no", "n")
+        if rep_id and manager:
+            out[rep_id] = {"rep_name": rep_name, "manager": manager, "active": active}
+
+    return out
+
+def get_roster_map_cached():
+    now = _now_unix()
+    if _ROSTER_CACHE["map"] and (now - _ROSTER_CACHE["ts"] < _ROSTER_TTL_SECONDS):
+        return _ROSTER_CACHE["map"]
+
+    values = fetch_roster_rows()
+    m = build_roster_map(values)
+
+    _ROSTER_CACHE["ts"] = now
+    _ROSTER_CACHE["map"] = m
+    return m
+
+def lookup_manager_for_rep(rep_id: int):
+    info = get_roster_map_cached().get(rep_id)
+    if not info:
+        return None
+    if not info.get("active", True):
+        return None
+    return info.get("manager")
 
 # ===========================
 # DISCORD UI: SALE FLOW
@@ -162,7 +285,6 @@ class CustomerModal(discord.ui.Modal, title="Enter Customer Name"):
         self.user_id = user_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Enforce allowed channels even after modal submit
         if not await require_allowed_channel(interaction):
             return
 
@@ -204,7 +326,7 @@ class ISPButtons(discord.ui.View):
         await self.pick(i, "Wire3")
 
     @discord.ui.button(label="Omni", style=discord.ButtonStyle.primary)
-    async def Omni(self, i: discord.Interaction, b: discord.ui.Button):
+    async def omni(self, i: discord.Interaction, b: discord.ui.Button):
         await self.pick(i, "Omni")
 
     @discord.ui.button(label="Brightspeed", style=discord.ButtonStyle.primary)
@@ -255,17 +377,35 @@ class PlanSelect(discord.ui.Select):
             return
 
         plan = self.values[0]
+        rep_id = interaction.user.id
         rep_name = interaction.user.display_name
 
+        manager = lookup_manager_for_rep(rep_id)
+        if not manager:
+            await interaction.response.send_message(
+                "⚠️ You’re not assigned to a manager yet (or you’re inactive). "
+                "An admin needs to add you to the **Roster** sheet.",
+                ephemeral=True
+            )
+            return
+
         # 1) append to sheet
-        append_sale_to_sheet(rep_name, self.customer, self.isp, plan)
+        try:
+            append_sale_to_sheet(rep_id, rep_name, manager, self.customer, self.isp, plan)
+        except Exception as e:
+            await interaction.response.send_message(
+                f"⚠️ Could not log to Google Sheets. Try again.\n`{type(e).__name__}: {e}`",
+                ephemeral=True
+            )
+            return
 
         # 2) fetch today's sales FROM SHEET (so deletions/cancels update counts)
-        counts = get_rep_counts(rep_name)
+        counts = get_rep_counts(rep_id)
 
         # confirmation embed
         embed = discord.Embed(title="✅ Sale Logged!", color=discord.Color.gold())
         embed.add_field(name="Rep", value=rep_name, inline=False)
+        embed.add_field(name="Manager", value=manager, inline=False)
         embed.add_field(name="Customer", value=self.customer, inline=False)
         embed.add_field(name="ISP", value=self.isp, inline=True)
         embed.add_field(name="Plan", value=plan, inline=True)
@@ -299,7 +439,7 @@ class LeaderboardModeSelect(discord.ui.Select):
         await interaction.response.defer()  # avoid "interaction failed" while we fetch sheet
 
         rows = fetch_sales_rows()
-        counts = compute_counts(rows, mode=mode)
+        counts = compute_counts(rows, mode=mode, key="rep")
 
         if not counts:
             await interaction.followup.send("No sales found for that timeframe.", ephemeral=True)
@@ -315,9 +455,10 @@ class LeaderboardModeSelect(discord.ui.Select):
         embed = discord.Embed(title=title_map.get(mode, "🏆 Leaderboard"), color=discord.Color.gold())
 
         medals = ["🥇", "🥈", "🥉"]
-        for idx, (rep, total) in enumerate(sorted_reps[:25], start=1):
+        for idx, (rep_key, total) in enumerate(sorted_reps[:25], start=1):
             rank_icon = medals[idx - 1] if idx <= 3 else f"#{idx}"
-            embed.add_field(name=f"{rank_icon} {rep}", value=f"**{total}** sales", inline=False)
+            # rep_key is RepId; display the key directly unless you want to map RepId->name
+            embed.add_field(name=f"{rank_icon} {rep_key}", value=f"**{total}** sales", inline=False)
 
         embed.set_footer(text="Counts pulled from Google Sheets")
         await interaction.followup.send(embed=embed)
@@ -328,14 +469,63 @@ class LeaderboardView(discord.ui.View):
         self.add_item(LeaderboardModeSelect())
 
 # ===========================
+# DISCORD UI: MANAGER LEADERBOARD
+# ===========================
+class ManagerboardModeSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Daily", value="daily", description="Today only"),
+            discord.SelectOption(label="Monthly", value="monthly", description="This month"),
+            discord.SelectOption(label="YTD", value="ytd", description="Year-to-date"),
+        ]
+        super().__init__(
+            placeholder="Choose manager leaderboard timeframe…",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await require_allowed_channel(interaction):
+            return
+
+        mode = self.values[0]
+        await interaction.response.defer(ephemeral=True)
+
+        rows = fetch_sales_rows()
+        counts = compute_counts(rows, mode=mode, key="manager")
+
+        if not counts:
+            await interaction.followup.send("No sales found for that timeframe.", ephemeral=True)
+            return
+
+        sorted_mgrs = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+
+        title_map = {
+            "daily": "🏆 Manager Leaderboard (Daily)",
+            "monthly": "🏆 Manager Leaderboard (Monthly)",
+            "ytd": "🏆 Manager Leaderboard (YTD)",
+        }
+        embed = discord.Embed(title=title_map.get(mode, "🏆 Manager Leaderboard"), color=discord.Color.gold())
+
+        medals = ["🥇", "🥈", "🥉"]
+        for idx, (mgr, total) in enumerate(sorted_mgrs[:25], start=1):
+            rank_icon = medals[idx - 1] if idx <= 3 else f"#{idx}"
+            embed.add_field(name=f"{rank_icon} {mgr}", value=f"**{total}** sales", inline=False)
+
+        embed.set_footer(text="Counts pulled from Google Sheets")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+class ManagerboardView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+        self.add_item(ManagerboardModeSelect())
+
+# ===========================
 # BOT SETUP
 # ===========================
 intents = discord.Intents.default()
-intents.members = True  # for general usefulness; counts use sheet rep names anyway
-
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0"))
 
 @bot.event
 async def on_ready():
@@ -347,7 +537,6 @@ async def on_ready():
         await bot.tree.sync()
         print(f"Bot is live as {bot.user} (global sync)")
 
-
 # ===========================
 # SLASH COMMANDS
 # ===========================
@@ -357,7 +546,7 @@ async def sale(interaction: discord.Interaction):
         return
     await interaction.response.send_modal(CustomerModal(interaction.user.id))
 
-@bot.tree.command(name="leaderboard", description="Show leaderboard: Daily, Monthly, or YTD (#sales or #managers)")
+@bot.tree.command(name="leaderboard", description="Show rep leaderboard: Daily, Monthly, or YTD (#sales or #managers)")
 async def leaderboard(interaction: discord.Interaction):
     if not await require_allowed_channel(interaction):
         return
@@ -369,6 +558,18 @@ async def leaderboard(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, view=LeaderboardView(), ephemeral=True)
 
+@bot.tree.command(name="managerboard", description="Show manager leaderboard: Daily, Monthly, or YTD (#sales or #managers)")
+async def managerboard(interaction: discord.Interaction):
+    if not await require_allowed_channel(interaction):
+        return
+
+    embed = discord.Embed(
+        title="Manager Leaderboard",
+        description="Pick a timeframe:",
+        color=discord.Color.blurple()
+    )
+    await interaction.response.send_message(embed=embed, view=ManagerboardView(), ephemeral=True)
+
 @bot.tree.command(name="mysales", description="View your sales: Daily, Monthly, YTD (#sales or #managers)")
 async def mysales(interaction: discord.Interaction):
     if not await require_allowed_channel(interaction):
@@ -376,8 +577,8 @@ async def mysales(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
 
-    rep_name = interaction.user.display_name
-    counts = get_rep_counts(rep_name)
+    rep_id = interaction.user.id
+    counts = get_rep_counts(rep_id)
 
     embed = discord.Embed(title="📊 Your Sales", color=discord.Color.blue())
     embed.add_field(name="Daily", value=str(counts["daily"]), inline=True)
@@ -386,6 +587,12 @@ async def mysales(interaction: discord.Interaction):
     embed.set_footer(text="Counts pulled from Google Sheets")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="myid", description="Show your Discord User ID (useful for the Roster sheet)")
+async def myid(interaction: discord.Interaction):
+    if not await require_allowed_channel(interaction):
+        return
+    await interaction.response.send_message(f"Your Discord User ID is: `{interaction.user.id}`", ephemeral=True)
 
 @bot.tree.command(name="reset", description="Reset bot (admin only) — does NOT delete Google Sheet rows")
 async def reset(interaction: discord.Interaction):
