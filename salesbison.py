@@ -536,6 +536,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     if DEV_GUILD_ID:
         guild = discord.Object(id=DEV_GUILD_ID)
+        bot.tree.copy_global_to(guild=guild)
         synced = await bot.tree.sync(guild=guild)
         print(f"Bot is live as {bot.user} (guild sync)")
         print("Synced commands:", [c.name for c in synced])
