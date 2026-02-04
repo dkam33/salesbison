@@ -22,7 +22,15 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SALES_CHANNEL_ID = int(os.getenv("SALES_CHANNEL_ID", "0"))         # REQUIRED
 MANAGERS_CHANNEL_ID = int(os.getenv("MANAGERS_CHANNEL_ID", "0"))   # REQUIRED
 DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0"))                # Optional: faster command sync during dev
-ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID", "0"))   # REQUIRED for /totals
+ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID", "0"))         # REQUIRED for /totals
+
+# Dealer channels
+ELITE_MARKETING_GROUP_CHANNEL_ID = int(os.getenv("ELITE_MARKETING_GROUP_CHANNEL_ID", "0"))
+THE_BAKERY_CHANNEL_ID = int(os.getenv("THE_BAKERY_CHANNEL_ID", "0"))
+
+# Dealer "group names" (strings written into Manager column for bulk logs)
+ELITE_MARKETING_GROUP = os.getenv("ELITE_MARKETING_GROUP", "").strip()
+THE_BAKERY = os.getenv("THE_BAKERY", "").strip()
 
 if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN env var.")
@@ -37,8 +45,19 @@ if MANAGERS_CHANNEL_ID == 0:
 if ADMIN_CHANNEL_ID == 0:
     raise RuntimeError("Missing/invalid ADMIN_CHANNEL_ID env var.")
 
+# Dealer vars are required for /bulklog
+if ELITE_MARKETING_GROUP_CHANNEL_ID == 0 or THE_BAKERY_CHANNEL_ID == 0:
+    raise RuntimeError("Missing/invalid ELITE_MARKETING_GROUP_CHANNEL_ID or THE_BAKERY_CHANNEL_ID env var.")
+if not ELITE_MARKETING_GROUP or not THE_BAKERY:
+    raise RuntimeError("Missing ELITE_MARKETING_GROUP or THE_BAKERY env var.")
 
-ALLOWED_CHANNEL_IDS = {SALES_CHANNEL_ID, MANAGERS_CHANNEL_ID, ADMIN_CHANNEL_ID}
+DEALER_CHANNEL_IDS = {ELITE_MARKETING_GROUP_CHANNEL_ID, THE_BAKERY_CHANNEL_ID}
+DEALER_GROUP_BY_CHANNEL = {
+    ELITE_MARKETING_GROUP_CHANNEL_ID: ELITE_MARKETING_GROUP,
+    THE_BAKERY_CHANNEL_ID: THE_BAKERY,
+}
+
+ALLOWED_CHANNEL_IDS = {SALES_CHANNEL_ID, MANAGERS_CHANNEL_ID, ADMIN_CHANNEL_ID, *DEALER_CHANNEL_IDS}
 
 # ===========================
 # GOOGLE SHEETS CLIENT
@@ -75,15 +94,16 @@ ROSTER_RANGE = "Roster!A:D"
 # HELPERS: CHANNEL GATING
 # ===========================
 async def require_allowed_channel(interaction: discord.Interaction) -> bool:
-    """Allow only #sales or #managers. Return True if ok, else respond and return False."""
+    """Allow only approved channels. Return True if ok, else respond and return False."""
     if interaction.channel_id not in ALLOWED_CHANNEL_IDS:
         await interaction.response.send_message(
-            f"This bot only works in <#{SALES_CHANNEL_ID}> or <#{MANAGERS_CHANNEL_ID}>.",
+            f"This bot only works in <#{SALES_CHANNEL_ID}>, <#{MANAGERS_CHANNEL_ID}>, <#{ADMIN_CHANNEL_ID}>, "
+            f"<#{ELITE_MARKETING_GROUP_CHANNEL_ID}>, or <#{THE_BAKERY_CHANNEL_ID}>.",
             ephemeral=True
         )
         return False
     return True
-    
+
 async def require_admin_channel(interaction: discord.Interaction) -> bool:
     if interaction.channel_id != ADMIN_CHANNEL_ID:
         await interaction.response.send_message(
@@ -99,6 +119,17 @@ async def require_admin_permission(interaction: discord.Interaction) -> bool:
         return False
     return True
 
+async def require_dealer_channel(interaction: discord.Interaction) -> bool:
+    if interaction.channel_id not in DEALER_CHANNEL_IDS:
+        await interaction.response.send_message(
+            f"Dealer-only command. Use it in <#{ELITE_MARKETING_GROUP_CHANNEL_ID}> or <#{THE_BAKERY_CHANNEL_ID}>.",
+            ephemeral=True
+        )
+        return False
+    return True
+
+def get_dealer_group_name(interaction: discord.Interaction) -> str:
+    return DEALER_GROUP_BY_CHANNEL.get(interaction.channel_id, "Dealer Group")
 
 # ===========================
 # GOOGLE SHEETS: APPEND
@@ -111,6 +142,14 @@ def append_sale_to_sheet(rep_id: int, rep_name: str, manager: str, customer: str
         range=SHEET_RANGE,
         valueInputOption="RAW",
         body={"values": row},
+    ).execute()
+
+def append_sales_batch_to_sheet(rows: list[list[str]]):
+    sheet_api.append(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=SHEET_RANGE,
+        valueInputOption="RAW",
+        body={"values": rows},
     ).execute()
 
 # ===========================
@@ -224,7 +263,6 @@ def get_total_counts():
     all_time = sum(compute_counts(rows, mode="all", key="rep").values())
     return {"daily": daily, "monthly": monthly, "ytd": ytd, "all": all_time}
 
-
 # ===========================
 # ROSTER LOOKUP (RepId -> Manager / RepName)
 # ===========================
@@ -305,6 +343,63 @@ def get_rep_name_map():
         if name:
             rep_map[str(rep_id)] = name
     return rep_map
+
+# ===========================
+# BULK LOGGING (dealer channels only)
+# ===========================
+MAX_BULK_LOG = 200  # safety cap
+
+class BulkCountModal(discord.ui.Modal, title="Bulk Log (count only)"):
+    count = discord.ui.TextInput(
+        label="How many total sales to log?",
+        placeholder="e.g. 27",
+        required=True,
+        max_length=4
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_allowed_channel(interaction):
+            return
+        if not await require_dealer_channel(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            n = int(self.count.value.strip())
+        except Exception:
+            await interaction.followup.send("Enter a whole number, e.g. `27`.", ephemeral=True)
+            return
+
+        if n <= 0:
+            await interaction.followup.send("Count must be at least 1.", ephemeral=True)
+            return
+
+        if n > MAX_BULK_LOG:
+            await interaction.followup.send(f"Too large. Max per bulk log is {MAX_BULK_LOG}.", ephemeral=True)
+            return
+
+        rep_id = interaction.user.id
+        rep_name = interaction.user.display_name
+        group_name = get_dealer_group_name(interaction)
+        ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+
+        # Timestamp | RepId | RepName | Manager | Customer | ISP | Plan
+        rows = [[ts, str(rep_id), rep_name, group_name, "Dealer", "", ""] for _ in range(n)]
+
+        try:
+            append_sales_batch_to_sheet(rows)
+        except Exception as e:
+            await interaction.followup.send(
+                f"⚠️ Could not log to Google Sheets.\n`{type(e).__name__}: {e}`",
+                ephemeral=True
+            )
+            return
+
+        await interaction.followup.send(
+            f"✅ Logged **{n}** sales for **{group_name}**.",
+            ephemeral=True
+        )
 
 # ===========================
 # DISCORD UI: SALE FLOW
@@ -579,13 +674,10 @@ async def on_ready():
 # ===========================
 @bot.tree.command(name="totals", description="Admin totals: Daily, Monthly, YTD, All-time")
 async def totals(interaction: discord.Interaction):
-    # allow bot to run in your allowed channels generally
     if not await require_allowed_channel(interaction):
         return
-    # hard gate: only in admin channel
     if not await require_admin_channel(interaction):
         return
-    # optional: only admins can run it
     if not await require_admin_permission(interaction):
         return
 
@@ -673,8 +765,15 @@ async def reset(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+@bot.tree.command(name="bulklog", description="Dealer: log a total count of sales (dealer channels only)")
+async def bulklog(interaction: discord.Interaction):
+    if not await require_allowed_channel(interaction):
+        return
+    if not await require_dealer_channel(interaction):
+        return
+    await interaction.response.send_modal(BulkCountModal())
+
 # ===========================
 # RUN BOT
 # ===========================
 bot.run(TOKEN)
-
