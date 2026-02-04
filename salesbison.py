@@ -22,6 +22,7 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SALES_CHANNEL_ID = int(os.getenv("SALES_CHANNEL_ID", "0"))         # REQUIRED
 MANAGERS_CHANNEL_ID = int(os.getenv("MANAGERS_CHANNEL_ID", "0"))   # REQUIRED
 DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0"))                # Optional: faster command sync during dev
+ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID", "0"))   # REQUIRED for /totals
 
 if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN env var.")
@@ -33,8 +34,11 @@ if SALES_CHANNEL_ID == 0:
     raise RuntimeError("Missing/invalid SALES_CHANNEL_ID env var.")
 if MANAGERS_CHANNEL_ID == 0:
     raise RuntimeError("Missing/invalid MANAGERS_CHANNEL_ID env var.")
+if ADMIN_CHANNEL_ID == 0:
+    raise RuntimeError("Missing/invalid ADMIN_CHANNEL_ID env var.")
 
-ALLOWED_CHANNEL_IDS = {SALES_CHANNEL_ID, MANAGERS_CHANNEL_ID}
+
+ALLOWED_CHANNEL_IDS = {SALES_CHANNEL_ID, MANAGERS_CHANNEL_ID, ADMIN_CHANNEL_ID}
 
 # ===========================
 # GOOGLE SHEETS CLIENT
@@ -75,6 +79,15 @@ async def require_allowed_channel(interaction: discord.Interaction) -> bool:
     if interaction.channel_id not in ALLOWED_CHANNEL_IDS:
         await interaction.response.send_message(
             f"This bot only works in <#{SALES_CHANNEL_ID}> or <#{MANAGERS_CHANNEL_ID}>.",
+            ephemeral=True
+        )
+        return False
+    return True
+    
+async def require_admin_channel(interaction: discord.Interaction) -> bool:
+    if interaction.channel_id != ADMIN_CHANNEL_ID:
+        await interaction.response.send_message(
+            f"Admin-only command. Use it in <#{ADMIN_CHANNEL_ID}>.",
             ephemeral=True
         )
         return False
@@ -195,6 +208,15 @@ def get_rep_counts(rep_id: int):
     monthly = compute_counts(rows, mode="monthly", key="rep").get(rep_key, 0)
     ytd = compute_counts(rows, mode="ytd", key="rep").get(rep_key, 0)
     return {"daily": daily, "monthly": monthly, "ytd": ytd}
+
+def get_total_counts():
+    rows = fetch_sales_rows()
+    daily = sum(compute_counts(rows, mode="daily", key="rep").values())
+    monthly = sum(compute_counts(rows, mode="monthly", key="rep").values())
+    ytd = sum(compute_counts(rows, mode="ytd", key="rep").values())
+    all_time = sum(compute_counts(rows, mode="all", key="rep").values())
+    return {"daily": daily, "monthly": monthly, "ytd": ytd, "all": all_time}
+
 
 # ===========================
 # ROSTER LOOKUP (RepId -> Manager / RepName)
@@ -548,6 +570,32 @@ async def on_ready():
 # ===========================
 # SLASH COMMANDS
 # ===========================
+@bot.tree.command(name="totals", description="Admin totals: Daily, Monthly, YTD, All-time")
+async def totals(interaction: discord.Interaction):
+    # allow bot to run in your allowed channels generally
+    if not await require_allowed_channel(interaction):
+        return
+    # hard gate: only in admin channel
+    if not await require_admin_channel(interaction):
+        return
+    # optional: only admins can run it
+    if not await require_admin_permission(interaction):
+        return
+
+    await interaction.response.defer()  # public message in admin channel
+
+    totals = get_total_counts()
+    now = datetime.now(ET)
+
+    embed = discord.Embed(title="📈 Total Sales", color=discord.Color.green())
+    embed.add_field(name="Daily", value=str(totals["daily"]), inline=True)
+    embed.add_field(name="Monthly", value=str(totals["monthly"]), inline=True)
+    embed.add_field(name="YTD", value=str(totals["ytd"]), inline=True)
+    embed.add_field(name="All-time", value=str(totals["all"]), inline=True)
+    embed.set_footer(text=f"As of {now.strftime('%Y-%m-%d %H:%M:%S ET')}")
+
+    await interaction.followup.send(embed=embed)
+
 @bot.tree.command(name="sale", description="Log a new sale (#sales or #managers)")
 async def sale(interaction: discord.Interaction):
     if not await require_allowed_channel(interaction):
