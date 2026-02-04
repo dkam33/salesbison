@@ -93,6 +93,13 @@ async def require_admin_channel(interaction: discord.Interaction) -> bool:
         return False
     return True
 
+async def require_admin_permission(interaction: discord.Interaction) -> bool:
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return False
+    return True
+
+
 # ===========================
 # GOOGLE SHEETS: APPEND
 # ===========================
