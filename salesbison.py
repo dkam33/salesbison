@@ -495,13 +495,13 @@ class ManagerboardModeSelect(discord.ui.Select):
             return
 
         mode = self.values[0]
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
 
         rows = fetch_sales_rows()
         counts = compute_counts(rows, mode=mode, key="manager")
 
         if not counts:
-            await interaction.followup.send("No sales found for that timeframe.", ephemeral=True)
+            await interaction.followup.send("No sales found for that timeframe.")
             return
 
         sorted_mgrs = sorted(counts.items(), key=lambda x: x[1], reverse=True)
@@ -519,7 +519,7 @@ class ManagerboardModeSelect(discord.ui.Select):
             embed.add_field(name=f"{rank_icon} {mgr}", value=f"**{total}** sales", inline=False)
 
         embed.set_footer(text="Counts pulled from Google Sheets")
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed)
 
 class ManagerboardView(discord.ui.View):
     def __init__(self):
