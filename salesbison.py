@@ -194,10 +194,11 @@ def fetch_sales_rows():
 # ===========================
 # COUNTS
 # ===========================
-def compute_counts(rows, *, mode: str, key: str = "rep"):
+def compute_counts(rows, *, mode: str, key: str = "rep", exclude_dealer_rows: bool = False):
     """
     mode in {"daily","monthly","ytd","all"}
     key in {"rep","manager"} determines grouping.
+    exclude_dealer_rows: if True, skips rows where Customer == "Dealer"
 
     Columns (Sheet1):
       A Timestamp
@@ -219,8 +220,13 @@ def compute_counts(rows, *, mode: str, key: str = "rep"):
         rep_id = str(r[1]).strip()
         rep_name = str(r[2]).strip()
         manager = str(r[3]).strip()
+        customer = str(r[4]).strip() if len(r) >= 5 else ""
 
         if not ts:
+            continue
+
+        # ✅ Exclude dealer bulk rows from rep leaderboard (and anything else that opts in)
+        if exclude_dealer_rows and customer.lower() == "dealer":
             continue
 
         include = False
@@ -345,11 +351,11 @@ def get_rep_name_map():
     return rep_map
 
 # ===========================
-# BULK LOGGING (dealer channels only)
+# BULK LOGGING (Dealer channels)
 # ===========================
 MAX_BULK_LOG = 200  # safety cap
 
-class BulkCountModal(discord.ui.Modal, title="Bulk Log (count only)"):
+class BulkCountModal(discord.ui.Modal, title="Bulk Log (count)"):
     count = discord.ui.TextInput(
         label="How many total sales to log?",
         placeholder="e.g. 27",
@@ -363,29 +369,51 @@ class BulkCountModal(discord.ui.Modal, title="Bulk Log (count only)"):
         if not await require_dealer_channel(interaction):
             return
 
-        await interaction.response.defer(ephemeral=True)
-
+        # Validate integer
         try:
             n = int(self.count.value.strip())
         except Exception:
-            await interaction.followup.send("Enter a whole number, e.g. `27`.", ephemeral=True)
+            await interaction.response.send_message("Enter a whole number, e.g. `27`.", ephemeral=True)
             return
 
         if n <= 0:
-            await interaction.followup.send("Count must be at least 1.", ephemeral=True)
+            await interaction.response.send_message("Count must be at least 1.", ephemeral=True)
             return
 
         if n > MAX_BULK_LOG:
-            await interaction.followup.send(f"Too large. Max per bulk log is {MAX_BULK_LOG}.", ephemeral=True)
+            await interaction.response.send_message(f"Too large. Max per bulk log is {MAX_BULK_LOG}.", ephemeral=True)
             return
+
+        # Store count in view state (we’ll prompt ISP next)
+        await interaction.response.send_message(
+            "Select ISP for this bulk log:",
+            view=BulkISPView(n),
+            ephemeral=True  # this is just the selection UI; the final confirmation will be public
+        )
+
+class BulkISPView(discord.ui.View):
+    def __init__(self, count: int):
+        super().__init__(timeout=120)
+        self.count = count
+
+    async def _submit(self, interaction: discord.Interaction, isp: str):
+        if not await require_allowed_channel(interaction):
+            return
+        if not await require_dealer_channel(interaction):
+            return
+
+        # public (non-ephemeral) confirmation, but we still defer ephemerally for button click responsiveness
+        await interaction.response.defer(ephemeral=True)
 
         rep_id = interaction.user.id
         rep_name = interaction.user.display_name
         group_name = get_dealer_group_name(interaction)
         ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
 
-        # Timestamp | RepId | RepName | Manager | Customer | ISP | Plan
-        rows = [[ts, str(rep_id), rep_name, group_name, "Dealer", "", ""] for _ in range(n)]
+        rows = []
+        for _ in range(self.count):
+            # Timestamp | RepId | RepName | Manager | Customer | ISP | Plan
+            rows.append([ts, str(rep_id), rep_name, group_name, "Dealer", isp, ""])
 
         try:
             append_sales_batch_to_sheet(rows)
@@ -396,10 +424,44 @@ class BulkCountModal(discord.ui.Modal, title="Bulk Log (count only)"):
             )
             return
 
+        # Public confirmation in the channel (NOT ephemeral)
         await interaction.followup.send(
-            f"✅ Logged **{n}** sales for **{group_name}**.",
-            ephemeral=True
+            f"✅ Bulk logged **{self.count}** sales for **{group_name}** (ISP: **{isp}**).",
+            ephemeral=False
         )
+
+        # Disable buttons after use
+        for item in self.children:
+            item.disabled = True
+        await interaction.message.edit(view=self)
+
+    @discord.ui.button(label="Wire3", style=discord.ButtonStyle.primary)
+    async def wire3(self, i: discord.Interaction, b: discord.ui.Button):
+        await self._submit(i, "Wire3")
+
+    @discord.ui.button(label="Omni", style=discord.ButtonStyle.primary)
+    async def omni(self, i: discord.Interaction, b: discord.ui.Button):
+        await self._submit(i, "Omni")
+
+    @discord.ui.button(label="Brightspeed", style=discord.ButtonStyle.primary)
+    async def brightspeed(self, i: discord.Interaction, b: discord.ui.Button):
+        await self._submit(i, "Brightspeed")
+
+    @discord.ui.button(label="Kinetic", style=discord.ButtonStyle.primary)
+    async def kinetic(self, i: discord.Interaction, b: discord.ui.Button):
+        await self._submit(i, "Kinetic")
+
+    @discord.ui.button(label="Astound", style=discord.ButtonStyle.primary)
+    async def astound(self, i: discord.Interaction, b: discord.ui.Button):
+        await self._submit(i, "Astound")
+
+    @discord.ui.button(label="Quantum", style=discord.ButtonStyle.primary)
+    async def quantum(self, i: discord.Interaction, b: discord.ui.Button):
+        await self._submit(i, "Quantum")
+
+    @discord.ui.button(label="Bluepeak", style=discord.ButtonStyle.primary)
+    async def bluepeak(self, i: discord.Interaction, b: discord.ui.Button):
+        await self._submit(i, "Bluepeak")
 
 # ===========================
 # DISCORD UI: SALE FLOW
@@ -567,7 +629,8 @@ class LeaderboardModeSelect(discord.ui.Select):
         await interaction.response.defer()  # not ephemeral so it posts normally
 
         rows = fetch_sales_rows()
-        counts = compute_counts(rows, mode=mode, key="rep")
+        # ✅ exclude dealer bulk rows from rep leaderboard
+        counts = compute_counts(rows, mode=mode, key="rep", exclude_dealer_rows=True)
 
         if not counts:
             await interaction.followup.send("No sales found for that timeframe.", ephemeral=True)
@@ -589,7 +652,7 @@ class LeaderboardModeSelect(discord.ui.Select):
             display_name = rep_name_map.get(str(rep_id_str), f"Unknown ({rep_id_str})")
             embed.add_field(name=f"{rank_icon} {display_name}", value=f"**{total}** sales", inline=False)
 
-        embed.set_footer(text="Counts pulled from Google Sheets")
+        embed.set_footer(text="Counts pulled from Google Sheets (Dealer rows excluded)")
         await interaction.followup.send(embed=embed)
 
 class LeaderboardView(discord.ui.View):
@@ -622,6 +685,7 @@ class ManagerboardModeSelect(discord.ui.Select):
         await interaction.response.defer()
 
         rows = fetch_sales_rows()
+        # ✅ managerboard includes everything (including Dealer rows)
         counts = compute_counts(rows, mode=mode, key="manager")
 
         if not counts:
@@ -681,16 +745,16 @@ async def totals(interaction: discord.Interaction):
     if not await require_admin_permission(interaction):
         return
 
-    await interaction.response.defer()  # public message in admin channel
+    await interaction.response.defer()
 
-    totals = get_total_counts()
+    totals_data = get_total_counts()
     now = datetime.now(ET)
 
     embed = discord.Embed(title="📈 Total Sales", color=discord.Color.green())
-    embed.add_field(name="Daily", value=str(totals["daily"]), inline=True)
-    embed.add_field(name="Monthly", value=str(totals["monthly"]), inline=True)
-    embed.add_field(name="YTD", value=str(totals["ytd"]), inline=True)
-    embed.add_field(name="All-time", value=str(totals["all"]), inline=True)
+    embed.add_field(name="Daily", value=str(totals_data["daily"]), inline=True)
+    embed.add_field(name="Monthly", value=str(totals_data["monthly"]), inline=True)
+    embed.add_field(name="YTD", value=str(totals_data["ytd"]), inline=True)
+    embed.add_field(name="All-time", value=str(totals_data["all"]), inline=True)
     embed.set_footer(text=f"As of {now.strftime('%Y-%m-%d %H:%M:%S ET')}")
 
     await interaction.followup.send(embed=embed)
@@ -771,6 +835,7 @@ async def bulklog(interaction: discord.Interaction):
         return
     if not await require_dealer_channel(interaction):
         return
+
     await interaction.response.send_modal(BulkCountModal())
 
 # ===========================
