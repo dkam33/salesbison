@@ -23,6 +23,7 @@ SALES_CHANNEL_ID = int(os.getenv("SALES_CHANNEL_ID", "0"))         # REQUIRED
 MANAGERS_CHANNEL_ID = int(os.getenv("MANAGERS_CHANNEL_ID", "0"))   # REQUIRED
 DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0"))                # Optional: faster command sync during dev
 ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID", "0"))         # REQUIRED for /totals
+THE_HERD_CHANNEL_ID = int(os.getenv("THE_HERD_CHANNEL_ID", "0"))  # REQUIRED for /sale
 
 # Dealer channels
 ELITE_MARKETING_GROUP_CHANNEL_ID = int(os.getenv("ELITE_MARKETING_GROUP_CHANNEL_ID", "0"))
@@ -44,6 +45,8 @@ if MANAGERS_CHANNEL_ID == 0:
     raise RuntimeError("Missing/invalid MANAGERS_CHANNEL_ID env var.")
 if ADMIN_CHANNEL_ID == 0:
     raise RuntimeError("Missing/invalid ADMIN_CHANNEL_ID env var.")
+if THE_HERD_CHANNEL_ID == 0:
+    raise RuntimeError("Missing/invalid THE_HERD_CHANNEL_ID env var.")
 
 # Dealer vars are required for /bulklog
 if ELITE_MARKETING_GROUP_CHANNEL_ID == 0 or THE_BAKERY_CHANNEL_ID == 0:
@@ -57,7 +60,7 @@ DEALER_GROUP_BY_CHANNEL = {
     THE_BAKERY_CHANNEL_ID: THE_BAKERY,
 }
 
-ALLOWED_CHANNEL_IDS = {SALES_CHANNEL_ID, MANAGERS_CHANNEL_ID, ADMIN_CHANNEL_ID, *DEALER_CHANNEL_IDS}
+ALLOWED_CHANNEL_IDS = {SALES_CHANNEL_ID, MANAGERS_CHANNEL_ID, ADMIN_CHANNEL_ID, THE_HERD_CHANNEL_ID, *DEALER_CHANNEL_IDS}
 
 # ===========================
 # GOOGLE SHEETS CLIENT
@@ -116,6 +119,15 @@ async def require_admin_channel(interaction: discord.Interaction) -> bool:
 async def require_admin_permission(interaction: discord.Interaction) -> bool:
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admin only.", ephemeral=True)
+        return False
+    return True
+
+async def require_herd_channel(interaction: discord.Interaction) -> bool:
+    if interaction.channel_id != THE_HERD_CHANNEL_ID:
+        await interaction.response.send_message(
+            f"This command can only be used in <#{THE_HERD_CHANNEL_ID}>.",
+            ephemeral=True
+        )
         return False
     return True
 
@@ -464,110 +476,24 @@ class BulkISPView(discord.ui.View):
         await self._submit(i, "Bluepeak")
 
 # ===========================
-# DISCORD UI: SALE FLOW
+# DISCORD UI: SALE FLOW (speed/plan only — #the_herd)
 # ===========================
-class CustomerModal(discord.ui.Modal, title="Enter Customer Name"):
-    customer_name = discord.ui.TextInput(
-        label="Customer Name",
-        placeholder="John Doe",
-        required=True,
-        max_length=80
-    )
-
-    def __init__(self, user_id: int):
-        super().__init__()
-        self.user_id = user_id
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not await require_allowed_channel(interaction):
-            return
-
-        embed = discord.Embed(
-            title="Customer received",
-            description=f"**{self.customer_name.value}**\n\nSelect ISP:",
-            color=discord.Color.blurple()
-        )
-
-        await interaction.response.send_message(
-            embed=embed,
-            view=ISPButtons(self.customer_name.value, self.user_id),
-            ephemeral=True
-        )
-
-class ISPButtons(discord.ui.View):
-    def __init__(self, customer_name: str, user_id: int):
-        super().__init__(timeout=120)
-        self.customer_name = customer_name
-        self.user_id = user_id
-
-    async def pick(self, interaction: discord.Interaction, isp: str):
-        if not await require_allowed_channel(interaction):
-            return
-
-        embed = discord.Embed(
-            title="ISP selected",
-            description=f"**{isp}**\n\nChoose plan:",
-            color=discord.Color.green()
-        )
-        await interaction.response.send_message(
-            embed=embed,
-            view=PlanDropdown(self.customer_name, isp, self.user_id),
-            ephemeral=True
-        )
-
-    @discord.ui.button(label="Wire3", style=discord.ButtonStyle.primary)
-    async def wire3(self, i: discord.Interaction, b: discord.ui.Button):
-        await self.pick(i, "Wire3")
-
-    @discord.ui.button(label="Omni", style=discord.ButtonStyle.primary)
-    async def omni(self, i: discord.Interaction, b: discord.ui.Button):
-        await self.pick(i, "Omni")
-
-    @discord.ui.button(label="Brightspeed", style=discord.ButtonStyle.primary)
-    async def brightspeed(self, i: discord.Interaction, b: discord.ui.Button):
-        await self.pick(i, "Brightspeed")
-
-    @discord.ui.button(label="Kinetic", style=discord.ButtonStyle.primary)
-    async def kinetic(self, i: discord.Interaction, b: discord.ui.Button):
-        await self.pick(i, "Kinetic")
-
-    @discord.ui.button(label="Astound", style=discord.ButtonStyle.primary)
-    async def astound(self, i: discord.Interaction, b: discord.ui.Button):
-        await self.pick(i, "Astound")
-
-    @discord.ui.button(label="Quantum", style=discord.ButtonStyle.primary)
-    async def quantum(self, i: discord.Interaction, b: discord.ui.Button):
-        await self.pick(i, "Quantum")
-
-    @discord.ui.button(label="Bluepeak", style=discord.ButtonStyle.primary)
-    async def bluepeak(self, i: discord.Interaction, b: discord.ui.Button):
-        await self.pick(i, "Bluepeak")
-
-class PlanDropdown(discord.ui.View):
-    def __init__(self, customer: str, isp: str, user_id: int):
-        super().__init__(timeout=120)
-        self.add_item(PlanSelect(customer, isp, user_id))
-
-class PlanSelect(discord.ui.Select):
-    def __init__(self, customer: str, isp: str, user_id: int):
-        self.customer = customer
-        self.isp = isp
-        self.user_id = user_id
-
+class SalePlanSelect(discord.ui.Select):
+    def __init__(self):
         options = [
             discord.SelectOption(label="500mbps"),
             discord.SelectOption(label="1G"),
             discord.SelectOption(label="1G+"),
         ]
         super().__init__(
-            placeholder="Choose a plan…",
+            placeholder="Choose a speed…",
             options=options,
             min_values=1,
             max_values=1
         )
 
     async def callback(self, interaction: discord.Interaction):
-        if not await require_allowed_channel(interaction):
+        if not await require_herd_channel(interaction):
             return
 
         plan = self.values[0]
@@ -577,14 +503,14 @@ class PlanSelect(discord.ui.Select):
         manager = lookup_manager_for_rep(rep_id)
         if not manager:
             await interaction.response.send_message(
-                "⚠️ You’re not assigned to a manager yet (or you’re inactive). "
+                "⚠️ You're not assigned to a manager yet (or you're inactive). "
                 "An admin needs to add you to the **Roster** sheet.",
                 ephemeral=True
             )
             return
 
         try:
-            append_sale_to_sheet(rep_id, rep_name, manager, self.customer, self.isp, plan)
+            append_sale_to_sheet(rep_id, rep_name, manager, "", "", plan)
         except Exception as e:
             await interaction.response.send_message(
                 f"⚠️ Could not log to Google Sheets. Try again.\n`{type(e).__name__}: {e}`",
@@ -596,14 +522,16 @@ class PlanSelect(discord.ui.Select):
 
         embed = discord.Embed(title="✅ Sale Logged!", color=discord.Color.gold())
         embed.add_field(name="Rep", value=rep_name, inline=False)
-        embed.add_field(name="Customer", value=self.customer, inline=False)
-        embed.add_field(name="ISP", value=self.isp, inline=True)
         embed.add_field(name="Plan", value=plan, inline=True)
         embed.add_field(name="Today's Sales", value=str(counts["daily"]), inline=False)
         embed.set_footer(text="Logged to Google Sheets")
 
         await interaction.response.send_message(embed=embed, ephemeral=False)
 
+class SalePlanView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.add_item(SalePlanSelect())
 # ===========================
 # DISCORD UI: LEADERBOARD MODE SELECT
 # ===========================
@@ -759,11 +687,16 @@ async def totals(interaction: discord.Interaction):
 
     await interaction.followup.send(embed=embed)
 
-@bot.tree.command(name="sale", description="Log a new sale (#sales or #managers)")
+@bot.tree.command(name="sale", description="Log a new sale (#the_herd only)")
 async def sale(interaction: discord.Interaction):
-    if not await require_allowed_channel(interaction):
+    if not await require_herd_channel(interaction):
         return
-    await interaction.response.send_modal(CustomerModal(interaction.user.id))
+    embed = discord.Embed(
+        title="Log a Sale",
+        description="Select your speed:",
+        color=discord.Color.blurple()
+    )
+    await interaction.response.send_message(embed=embed, view=SalePlanView(), ephemeral=True)
 
 @bot.tree.command(name="leaderboard", description="Show rep leaderboard: Daily, Monthly, or YTD (#sales or #managers)")
 async def leaderboard(interaction: discord.Interaction):
