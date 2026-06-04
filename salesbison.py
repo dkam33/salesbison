@@ -327,7 +327,7 @@ def build_roster_map(values):
             continue
 
         active = active_raw not in ("false", "0", "no", "n")
-        if rep_id and manager:
+        if rep_id:
             out[rep_id] = {"rep_name": rep_name, "manager": manager, "active": active}
 
     return out
@@ -345,12 +345,29 @@ def get_roster_map_cached():
     return m
 
 def lookup_manager_for_rep(rep_id: int):
+    """Returns manager name, "Unassigned" if no manager yet, or None if inactive."""
     info = get_roster_map_cached().get(rep_id)
     if not info:
-        return None
+        return "Unassigned"
     if not info.get("active", True):
         return None
-    return info.get("manager")
+    return info.get("manager") or "Unassigned"
+
+def register_rep_if_new(rep_id: int, rep_name: str):
+    """Add a rep to the Roster sheet if they do not already exist."""
+    roster = get_roster_map_cached()
+    if rep_id in roster:
+        return
+    row = [[str(rep_id), rep_name, "", "TRUE"]]
+    sheet_api.append(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=ROSTER_RANGE,
+        valueInputOption="RAW",
+        body={"values": row},
+    ).execute()
+    # Bust cache so next lookup picks up the new row
+    _ROSTER_CACHE["ts"] = 0
+    _ROSTER_CACHE["map"] = {}
 
 def get_rep_name_map():
     """RepId -> RepName map from Roster only (fast + stable)."""
@@ -500,11 +517,13 @@ class SalePlanSelect(discord.ui.Select):
         rep_id = interaction.user.id
         rep_name = interaction.user.display_name
 
+        # Auto-register rep if first time using /sale
+        register_rep_if_new(rep_id, rep_name)
+
         manager = lookup_manager_for_rep(rep_id)
-        if not manager:
+        if manager is None:
             await interaction.response.send_message(
-                "⚠️ You're not assigned to a manager yet (or you're inactive). "
-                "An admin needs to add you to the **Roster** sheet.",
+                "⚠️ Your account is marked inactive. Contact an admin.",
                 ephemeral=True
             )
             return
